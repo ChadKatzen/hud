@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Poker Mavens HUD — Big O (PLO5 Hi-Lo)
 // @namespace    pokermavens-hud
-// @version      0.6.0
+// @version      0.6.1
 // @description  Heads-up display for Poker Mavens 5-card PL Omaha Hi-Lo: a clean per-table HUD panel with per-villain stats, header tooltips, and click-to-edit notes/tags. Durable Tampermonkey storage with JSON backup/restore, plus a ground-truth recorder to calibrate the action parser against live hands.
 // @match        http://*/*
 // @match        https://*/*
@@ -89,7 +89,7 @@
 
   // Columns shown on the always-on grid: [key, header, tooltip, accessor]
   const COLUMNS = [
-    ['hnd',  'HND',  'Hands — number of hands observed for this player (the sample size behind every stat).', (s) => s.hands || 0],
+    ['hnd',  'HND',  'Hands — number of hands observed for this player.', (s) => s.hands || 0],
     ['vpip', 'VPIP', 'Voluntarily Put $ In Pot — % of hands the player limps, calls, or raises preflop (blinds checked for free don’t count). High = loose.', (s) => pct(s.vpip)],
     ['pfr',  'PFR',  'Preflop Raise — % of hands the player raises preflop. Gap between VPIP and PFR shows how passive they are.', (s) => pct(s.pfr)],
     ['limp', 'LIMP', 'Limp — % of hands the player open-limps: just calls the big blind as the first player in the pot instead of raising.', (s) => pct(s.limp)],
