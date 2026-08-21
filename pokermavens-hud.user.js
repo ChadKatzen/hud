@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         Poker Mavens HUD — Big O (PLO5 Hi-Lo)
 // @namespace    pokermavens-hud
-// @version      0.5.0
+// @version      0.6.0
 // @description  Heads-up display for Poker Mavens 5-card PL Omaha Hi-Lo: a clean per-table HUD panel with per-villain stats, header tooltips, and click-to-edit notes/tags. Durable Tampermonkey storage with JSON backup/restore, plus a ground-truth recorder to calibrate the action parser against live hands.
 // @match        http://*/*
 // @match        https://*/*
 // @run-at       document-idle
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @updateURL    https://raw.githubusercontent.com/ChadKatzen/hud/main/pokermavens-hud.user.js
+// @downloadURL  https://raw.githubusercontent.com/ChadKatzen/hud/main/pokermavens-hud.user.js
 // ==/UserScript==
 //
 // The @match is intentionally broad so this public file contains no server
