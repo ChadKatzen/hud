@@ -1,0 +1,5 @@
+# Keep design/notes local — never publish
+*.md
+
+# OS cruft
+.DS_Store
