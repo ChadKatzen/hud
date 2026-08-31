@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Poker Mavens HUD — Big O (PLO5 Hi-Lo)
 // @namespace    pokermavens-hud
-// @version      0.7.0
+// @version      0.8.0
 // @description  Heads-up display for Poker Mavens 5-card PL Omaha Hi-Lo: a clean per-table HUD panel with per-villain stats, header tooltips, and click-to-edit notes/tags. Durable Tampermonkey storage with JSON backup/restore, plus a ground-truth recorder to calibrate the action parser against live hands.
 // @match        http://*/*
 // @match        https://*/*
@@ -155,13 +155,34 @@
   // ---------------------------------------------------------------------------
   // Ground-truth recorder
   // ---------------------------------------------------------------------------
+  // Board-card / chip diagnostics: the current .card selector reads 0 board
+  // cards, so try several candidates and record their visible counts. This
+  // tells the offline calibration which selector actually tracks the board.
+  const BOARD_SELS = ['.card', '.cardface', '.boardcard', '.tablecard', '.communitycard', '[class*="card"]'];
+  function boardDiag(root) {
+    const out = {};
+    for (const s of BOARD_SELS) {
+      try { out[s] = [...root.querySelectorAll(s)].filter((e) => e.offsetParent !== null).length; } catch {}
+    }
+    return out;
+  }
+  // Full text of the table's log/narration areas — likely holds "*** FLOP ***"
+  // style street markers and bet amounts, which would let us parse every street
+  // cleanly. Bounded so the capture stays small.
+  function logText(root) {
+    const parts = [];
+    ['.tablechattext', '.tablestatstext'].forEach((s) => { const e = root.querySelector(s); if (e) parts.push(`[${s}]\n` + (e.innerText || '')); });
+    root.querySelectorAll('.memo').forEach((m, i) => parts.push(`[memo${i}]\n` + (m.innerText || '')));
+    return parts.join('\n---\n').slice(-6000);
+  }
+
   const recorder = {
-    cur: null,
-    start(root, hand) { this.cur = { hand, table: tableName(root), t0: new Date().toISOString(), frames: [] }; },
-    frame(seats, pot, street) {
+    cur: null, root: null,
+    start(root, hand) { this.root = root; this.cur = { hand, table: tableName(root), t0: new Date().toISOString(), frames: [] }; },
+    frame(seats, pot, street, bd) {
       if (!store.cfg.recording || !this.cur) return;
       this.cur.frames.push({
-        pot, street,
+        pot, street, bd,
         seats: seats.filter((s) => s.name).map((s) => ({
           i: s.idx, name: s.name, info: s.info, stack: s.stack,
           committed: s.committed, active: s.active, button: s.button,
@@ -171,11 +192,12 @@
     end() {
       const done = (this.cur && this.cur.frames.length) ? this.cur : null;
       if (done) {
+        try { if (this.root) done.log = logText(this.root); } catch {}
         store.rec.push(done);
         if (store.rec.length > 400) store.rec = store.rec.slice(-400);
         save(LS.REC, store.rec);
       }
-      this.cur = null;
+      this.cur = null; this.root = null;
       return done;
     },
   };
@@ -196,10 +218,11 @@
         const seats = readSeats(root);
         const pot = potOf(root);
         const street = streetName(boardCount(root));
-        const sig = seats.map((s) => `${s.name}:${s.info}:${s.committed}:${s.active}`).join('|') + '#' + pot + '#' + street;
+        const bd = boardDiag(root);
+        const sig = seats.map((s) => `${s.name}:${s.info}:${s.committed}:${s.active}`).join('|') + '#' + pot + '#' + street + '#' + JSON.stringify(bd);
         if (sig === this.lastSig) return;
         this.lastSig = sig;
-        recorder.frame(seats, pot, street);
+        recorder.frame(seats, pot, street, bd);
       },
       startHand(hand) { this.hand = hand; this.lastSig = ''; recorder.start(root, hand); },
       endHand() {
