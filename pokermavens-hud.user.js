@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Poker Mavens HUD — Big O (PLO5 Hi-Lo)
 // @namespace    pokermavens-hud
-// @version      0.6.1
+// @version      0.7.0
 // @description  Heads-up display for Poker Mavens 5-card PL Omaha Hi-Lo: a clean per-table HUD panel with per-villain stats, header tooltips, and click-to-edit notes/tags. Durable Tampermonkey storage with JSON backup/restore, plus a ground-truth recorder to calibrate the action parser against live hands.
 // @match        http://*/*
 // @match        https://*/*
@@ -35,6 +35,7 @@
     TAGS:  'ddhud.tagvocab.v1',
     REC:   'ddhud.recorder.v1',
     CFG:   'ddhud.config.v1',
+    APPLIED: 'ddhud.applied.v1',
   };
   // Durable storage: prefer Tampermonkey's GM store (survives site-data clears,
   // rides TM cloud sync), fall back to page localStorage. On first run under GM,
@@ -65,6 +66,7 @@
     tags:  load(LS.TAGS, DEFAULT_TAGS.slice()),
     rec:   load(LS.REC, []),
     cfg:   load(LS.CFG, { recording: true, showHud: true }),
+    applied: load(LS.APPLIED, {}), // handId -> 1, so a hand is only counted once
   };
 
   // ---------------------------------------------------------------------------
@@ -167,12 +169,14 @@
       });
     },
     end() {
-      if (this.cur && this.cur.frames.length) {
-        store.rec.push(this.cur);
+      const done = (this.cur && this.cur.frames.length) ? this.cur : null;
+      if (done) {
+        store.rec.push(done);
         if (store.rec.length > 400) store.rec = store.rec.slice(-400);
         save(LS.REC, store.rec);
       }
       this.cur = null;
+      return done;
     },
   };
 
@@ -198,12 +202,109 @@
         recorder.frame(seats, pot, street);
       },
       startHand(hand) { this.hand = hand; this.lastSig = ''; recorder.start(root, hand); },
-      endHand() { if (!this.hand) return; recorder.end(); this.hand = null; },
+      endHand() {
+        if (!this.hand) return;
+        const done = recorder.end();
+        this.hand = null;
+        if (done && applyHand(done)) { save(LS.STATS, store.stats); save(LS.APPLIED, store.applied); renderPanels(); }
+      },
     };
     engines.set(root, eng);
     return eng;
   }
-  function inferActions(/* handRecord */) { /* TODO: lock against recorder data */ }
+  // ---------------------------------------------------------------------------
+  // Preflop parser — calibrated against real captured hands (see DESIGN.md).
+  // The client shows each action in a seat's .sp_info ("Post SB/BB", "Raise",
+  // "Call", "Check", "Fold", "Bet", "All-in"). "Raise" is preflop, "Bet" is
+  // postflop, and you can't check facing a raise preflop — those give a clean
+  // preflop/postflop boundary without needing bet sizes or a street marker.
+  // Postflop stats (CB/CHK/…) await a recorder upgrade that captures streets.
+  // ---------------------------------------------------------------------------
+  const PF_ACT = new Set(['Fold', 'Check', 'Call', 'Raise', 'Bet', 'All-in', 'Post SB', 'Post BB']);
+  const JUNK_NAME = /^(Time:|Reserved$|Wait for BB$|Sitting|Empty$)/i;
+  const isPlayer = (name) => !!name && !JUNK_NAME.test(name);
+
+  // Reconstruct the ordered (player, action) events from the flickering .sp_info
+  // snapshots: an action label that differs from the seat's previous label = a
+  // new action (labels revert to the stack between actions, so repeats survive).
+  function handEvents(h) {
+    const prev = {}, evs = [];
+    h.frames.forEach((f) => f.seats.forEach((s) => {
+      if (!isPlayer(s.name)) return;
+      const lab = PF_ACT.has(s.info);
+      if (lab && prev[s.name] !== s.info) evs.push({ p: s.name, a: s.info });
+      prev[s.name] = lab ? s.info : '$';
+    }));
+    return evs;
+  }
+
+  // Returns { dealt:[names], P:{ name: {vpip,pfr,limp,l3b,l3bOpp,tb,tbOpp,f3b,f3bOpp} } }
+  function parseHandPreflop(h) {
+    const dealt = new Set();
+    h.frames.forEach((f) => f.seats.forEach((s) => { if (isPlayer(s.name)) dealt.add(s.name); }));
+    const evs = handEvents(h);
+    let sb = null, bb = null, k = 0;
+    for (; k < evs.length; k++) {
+      if (evs[k].a === 'Post SB') sb = evs[k].p;
+      else if (evs[k].a === 'Post BB') bb = evs[k].p;
+      else break;
+    }
+    const P = {};
+    const get = (n) => (P[n] || (P[n] = { vpip: 0, pfr: 0, limp: 0, l3b: 0, l3bOpp: 0, tb: 0, tbOpp: 0, f3b: 0, f3bOpp: 0, _acted: false, _limped: false, _folded: false }));
+    let raises = 0, opener = null, threeBettor = null;
+    for (; k < evs.length; k++) {
+      const e = evs[k];
+      if (e.a === 'Bet') break;                              // postflop opener
+      if (e.a === 'Check') { if (raises >= 1) break; if (e.p === bb) break; break; }
+      const st = get(e.p); const facing = raises;
+      if (e.a === 'Fold') { if (st._limped && facing >= 1) st.l3bOpp = 1; st._folded = true; st._acted = true; continue; }
+      if (e.a === 'Call') {
+        st.vpip = 1;
+        if (!st._acted && facing === 0) { st.limp = 1; st._limped = true; }
+        if (facing >= 1) { if (st._limped) st.l3bOpp = 1; else if (!st.tb) st.tbOpp = 1; }
+        st._acted = true; continue;
+      }
+      if (e.a === 'Raise' || e.a === 'All-in') {
+        st.vpip = 1; st.pfr = 1;
+        if (facing === 0) { if (!opener) opener = e.p; }
+        else { st.tb = 1; if (st._limped) { st.l3b = 1; st.l3bOpp = 1; } else st.tbOpp = 1; if (!threeBettor) threeBettor = e.p; }
+        raises++; st._acted = true; continue;
+      }
+    }
+    if (opener && threeBettor && opener !== threeBettor) { const so = get(opener); so.f3bOpp = 1; if (so._folded) so.f3b = 1; }
+    return { dealt: [...dealt], sb, bb, P };
+  }
+
+  // Fold parsed per-hand facts into the persistent per-player counters.
+  function applyHand(h) {
+    const id = h && h.hand;
+    if (!id || store.applied[id]) return false;             // idempotent
+    const r = parseHandPreflop(h);
+    if (!r.dealt.length) { store.applied[id] = 1; return false; }
+    r.dealt.forEach((n) => {
+      const s = statFor(n); s.hands++;
+      s.vpip.n++; s.pfr.n++; s.limp.n++;                     // per-hand denominators
+    });
+    for (const [n, p] of Object.entries(r.P)) {
+      const s = statFor(n);
+      s.vpip.k += p.vpip; s.pfr.k += p.pfr; s.limp.k += p.limp;
+      s.limpReraise.n += p.l3bOpp; s.limpReraise.k += p.l3b;
+      s.threeBet.n += p.tbOpp;    s.threeBet.k += p.tb;
+      s.foldTo3Bet.n += p.f3bOpp; s.foldTo3Bet.k += p.f3b;
+      s.lastSeen = Date.now();
+    }
+    store.applied[id] = 1;
+    return true;
+  }
+
+  // Apply any recorded hands not yet counted (covers hands captured before the
+  // parser existed, and any missed live-apply).
+  function backfillStats() {
+    let changed = false;
+    for (const h of store.rec) if (applyHand(h)) changed = true;
+    if (changed) { save(LS.STATS, store.stats); save(LS.APPLIED, store.applied); }
+    return changed;
+  }
 
   // ---------------------------------------------------------------------------
   // HUD panel (one per open table). Draggable; header tooltips; click-to-note.
@@ -250,7 +351,7 @@
   function paintPanel(p, root) {
     p.querySelector('.ddhud-hd .sub').textContent = '— ' + tableName(root);
     const hero = heroName(root);
-    const seated = readSeats(root).filter((s) => s.name);
+    const seated = readSeats(root).filter((s) => isPlayer(s.name));
     const tbody = p.querySelector('tbody');
     tbody.innerHTML = seated.map((s) => {
       const st = store.stats[s.name] || newStat();
@@ -513,6 +614,7 @@
     const style = document.createElement('style');
     style.textContent = CSS;
     document.head.appendChild(style);
+    backfillStats();               // count any already-recorded hands
     mountControl();
     const obs = new MutationObserver(() => { for (const root of tableRoots()) engineFor(root).onMutation(); });
     obs.observe(document.body, { subtree: true, childList: true, characterData: true, attributes: true });
