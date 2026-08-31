@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Poker Mavens HUD — Big O (PLO5 Hi-Lo)
 // @namespace    pokermavens-hud
-// @version      0.9.0
+// @version      0.10.0
 // @description  Heads-up display for Poker Mavens 5-card PL Omaha Hi-Lo: a clean per-table HUD panel with per-villain stats, header tooltips, and click-to-edit notes/tags. Durable Tampermonkey storage with JSON backup/restore, plus a ground-truth recorder to calibrate the action parser against live hands.
 // @match        http://*/*
 // @match        https://*/*
@@ -87,7 +87,32 @@
   }
   function c() { return { n: 0, k: 0 }; }
   function pct(cc) { return cc && cc.n ? Math.round((100 * cc.k) / cc.n) : null; }
-  function statFor(name) { if (!store.stats[name]) store.stats[name] = newStat(); return store.stats[name]; }
+
+  // Stats are scoped per GAME TYPE (so PL Omaha-5, Limit Big O, Stud, … keep
+  // separate player profiles and never cross-contaminate). Composite key is
+  // `<gameKey>||<player>`. Notes/tags stay global per player (keyed by name).
+  const SK = (gk, name) => gk + '||' + name;
+  function statFor(gk, name) { const k = SK(gk, name); if (!store.stats[k]) store.stats[k] = newStat(); return store.stats[k]; }
+  function statGet(gk, name) { return store.stats[SK(gk, name)]; }
+
+  // Extract a stable game descriptor from a table's title, e.g.
+  // "5 CARD HI LO - PL Omaha-5 Hi-Lo (100 - 300) - Logged in as jkatz"
+  //   -> "PL Omaha-5 Hi-Lo"   (ignores table name, stakes, and hero suffix)
+  function gameDescriptor(title) {
+    if (!title) return '';
+    const t = title.replace(/ - Logged in as .*$/, '');
+    const m = t.match(/ - (.+?)\s*\([^)]*\)\s*$/);
+    if (m) return m[1].trim();
+    const i = t.indexOf(' - ');
+    return (i >= 0 ? t.slice(i + 3) : t).trim();
+  }
+  function gameKeyForRoot(root) { return gameDescriptor(gameTitle(root)) || tableName(root) || 'unknown'; }
+  // For a recorded hand: prefer its stored game title; else map its table name
+  // via tableToGame (built from hands that do carry a game); else the table name.
+  function gameKeyForRecord(h, tableToGame) {
+    if (h.game) return gameDescriptor(h.game) || h.table || 'unknown';
+    return (tableToGame && tableToGame[h.table]) || h.table || 'unknown';
+  }
 
   // Columns shown on the always-on grid: [key, header, tooltip, accessor]
   const COLUMNS = [
@@ -253,7 +278,7 @@
         if (!this.hand) return;
         const done = this.rec.end();
         this.hand = null;
-        if (done && applyHand(done)) { save(LS.STATS, store.stats); save(LS.APPLIED, store.applied); renderPanels(); }
+        if (done && applyHand(done, gameKeyForRoot(root))) { save(LS.STATS, store.stats); save(LS.APPLIED, store.applied); renderPanels(); }
       },
     };
     engines.set(root, eng);
@@ -322,18 +347,21 @@
     return { dealt: [...dealt], sb, bb, P };
   }
 
-  // Fold parsed per-hand facts into the persistent per-player counters.
-  function applyHand(h) {
+  // Fold parsed per-hand facts into the persistent per-player counters, scoped
+  // to the hand's game type. gk may be passed (backfill) or derived from h.game.
+  function applyHand(h, gk) {
     const id = h && h.hand;
     if (!id || store.applied[id]) return false;             // idempotent
     const r = parseHandPreflop(h);
     if (!r.dealt.length) { store.applied[id] = 1; return false; }
+    if (!r.sb && !r.bb) { store.applied[id] = 1; return false; } // no blinds (e.g. Stud) — parser doesn't apply
+    gk = gk || gameKeyForRecord(h);
     r.dealt.forEach((n) => {
-      const s = statFor(n); s.hands++;
+      const s = statFor(gk, n); s.hands++;
       s.vpip.n++; s.pfr.n++; s.limp.n++;                     // per-hand denominators
     });
     for (const [n, p] of Object.entries(r.P)) {
-      const s = statFor(n);
+      const s = statFor(gk, n);
       s.vpip.k += p.vpip; s.pfr.k += p.pfr; s.limp.k += p.limp;
       s.limpReraise.n += p.l3bOpp; s.limpReraise.k += p.l3b;
       s.threeBet.n += p.tbOpp;    s.threeBet.k += p.tb;
@@ -344,11 +372,24 @@
     return true;
   }
 
-  // Apply any recorded hands not yet counted (covers hands captured before the
-  // parser existed, and any missed live-apply).
+  // One-time migration from the old global (name-keyed) stats to per-game keys:
+  // if any stat key lacks the '||' game separator, wipe and rebuild from store.rec.
+  function migrateStatsSchema() {
+    const keys = Object.keys(store.stats);
+    const oldSchema = keys.length && keys.some((k) => !k.includes('||'));
+    if (!oldSchema) return false;
+    store.stats = {}; store.applied = {};
+    return true; // backfill will rebuild
+  }
+
+  // Apply any recorded hands not yet counted. Builds a table->game map first so
+  // hands recorded before the game field existed still bucket into the right game.
   function backfillStats() {
-    let changed = false;
-    for (const h of store.rec) if (applyHand(h)) changed = true;
+    const migrated = migrateStatsSchema();
+    const tableToGame = {};
+    for (const h of store.rec) if (h.game && h.table) tableToGame[h.table] = gameDescriptor(h.game) || h.table;
+    let changed = migrated;
+    for (const h of store.rec) if (applyHand(h, gameKeyForRecord(h, tableToGame))) changed = true;
     if (changed) { save(LS.STATS, store.stats); save(LS.APPLIED, store.applied); }
     return changed;
   }
@@ -408,10 +449,11 @@
     tog.classList.toggle('on', !!rec);
     tog.title = rec ? 'Recording & tracking this table — click to stop' : 'Not tracking this table — click to record';
     const hero = heroName(root);
+    const gk = gameKeyForRoot(root);
     const seated = readSeats(root).filter((s) => isPlayer(s.name));
     const tbody = p.querySelector('tbody');
     tbody.innerHTML = seated.map((s) => {
-      const st = store.stats[s.name] || newStat();
+      const st = statGet(gk, s.name) || newStat();
       const note = store.notes[s.name];
       const cells = COLUMNS.map(([k, h, tip, get]) => {
         const v = get(st);
@@ -425,10 +467,9 @@
     tbody.querySelectorAll('tr[data-player]').forEach((tr) => {
       tr.addEventListener('click', () => openNotes(tr.dataset.player));
     });
-    const capBits = [];
-    if (seated.every((s) => !(store.stats[s.name] && store.stats[s.name].hands))) capBits.push('Stats show “–” until calibrated.');
+    const capBits = [gk];
     capBits.push(recordingOn(root) ? 'Recording ●' : (store.cfg.recording ? 'Not tracking this table' : 'Recording off (all)'));
-    p.querySelector('.ddhud-cap').textContent = capBits.join('   ');
+    p.querySelector('.ddhud-cap').textContent = capBits.join('   ·   ');
   }
 
   // ---------------------------------------------------------------------------
@@ -550,9 +591,9 @@
   }
 
   // Full backup/restore of every ddhud key as one JSON file.
-  function saveAll() { save(LS.STATS, store.stats); save(LS.NOTES, store.notes); save(LS.TAGS, store.tags); save(LS.REC, store.rec); save(LS.CFG, store.cfg); }
+  function saveAll() { save(LS.STATS, store.stats); save(LS.NOTES, store.notes); save(LS.TAGS, store.tags); save(LS.REC, store.rec); save(LS.CFG, store.cfg); save(LS.APPLIED, store.applied); }
   function exportAll(cd) {
-    const data = { _app: 'ddhud', _v: 1, _exported: new Date().toISOString(), stats: store.stats, notes: store.notes, tags: store.tags, rec: store.rec, cfg: store.cfg };
+    const data = { _app: 'ddhud', _v: 2, _exported: new Date().toISOString(), stats: store.stats, notes: store.notes, tags: store.tags, rec: store.rec, cfg: store.cfg, applied: store.applied };
     const json = JSON.stringify(data);
     const blob = new Blob([json], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -574,7 +615,12 @@
         if (d.tags) store.tags = d.tags;
         if (d.rec) store.rec = d.rec;
         if (d.cfg) store.cfg = Object.assign(store.cfg, d.cfg);
-        saveAll(); renderPanels(); syncControl(cd);
+        // Restore the applied-set if present; otherwise rebuild stats cleanly
+        // from rec so an older backup can't double-count on import.
+        if (d.applied) store.applied = d.applied;
+        else { store.stats = {}; store.applied = {}; }
+        save(LS.APPLIED, store.applied);
+        backfillStats(); saveAll(); renderPanels(); syncControl(cd);
         msg(cd, `Restored ${Object.keys(store.stats).length} players + ${Object.keys(store.notes).length} notes.`);
       } catch (e) { msg(cd, 'Import failed: ' + e.message, true); }
     };
