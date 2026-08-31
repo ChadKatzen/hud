@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Poker Mavens HUD — Big O (PLO5 Hi-Lo)
 // @namespace    pokermavens-hud
-// @version      0.8.0
+// @version      0.9.0
 // @description  Heads-up display for Poker Mavens 5-card PL Omaha Hi-Lo: a clean per-table HUD panel with per-villain stats, header tooltips, and click-to-edit notes/tags. Durable Tampermonkey storage with JSON backup/restore, plus a ground-truth recorder to calibrate the action parser against live hands.
 // @match        http://*/*
 // @match        https://*/*
@@ -176,31 +176,53 @@
     return parts.join('\n---\n').slice(-6000);
   }
 
-  const recorder = {
-    cur: null, root: null,
-    start(root, hand) { this.root = root; this.cur = { hand, table: tableName(root), t0: new Date().toISOString(), frames: [] }; },
-    frame(seats, pot, street, bd) {
-      if (!store.cfg.recording || !this.cur) return;
-      this.cur.frames.push({
-        pot, street, bd,
-        seats: seats.filter((s) => s.name).map((s) => ({
-          i: s.idx, name: s.name, info: s.info, stack: s.stack,
-          committed: s.committed, active: s.active, button: s.button,
-        })),
-      });
-    },
-    end() {
-      const done = (this.cur && this.cur.frames.length) ? this.cur : null;
-      if (done) {
-        try { if (this.root) done.log = logText(this.root); } catch {}
-        store.rec.push(done);
-        if (store.rec.length > 400) store.rec = store.rec.slice(-400);
-        save(LS.REC, store.rec);
-      }
-      this.cur = null; this.root = null;
-      return done;
-    },
-  };
+  // One recorder per table (isolated), so simultaneous tables never clobber
+  // each other's in-progress capture. The persistent store.rec list is shared
+  // (each hand is tagged with its table/game and a unique hand id).
+  function makeRecorder() {
+    return {
+      cur: null, root: null,
+      start(root, hand) { this.root = root; this.cur = { hand, table: tableName(root), game: gameTitle(root), t0: new Date().toISOString(), frames: [] }; },
+      frame(seats, pot, street, bd) {
+        if (!this.cur) return;
+        this.cur.frames.push({
+          pot, street, bd,
+          seats: seats.filter((s) => s.name).map((s) => ({
+            i: s.idx, name: s.name, info: s.info, stack: s.stack,
+            committed: s.committed, active: s.active, button: s.button,
+          })),
+        });
+      },
+      end() {
+        const done = (this.cur && this.cur.frames.length) ? this.cur : null;
+        if (done) {
+          try { if (this.root) done.log = logText(this.root); } catch {}
+          store.rec.push(done);
+          if (store.rec.length > 400) store.rec = store.rec.slice(-400);
+          save(LS.REC, store.rec);
+        }
+        this.cur = null; this.root = null;
+        return done;
+      },
+    };
+  }
+
+  // Per-table recording preference. Defaults ON only for the calibrated game
+  // (Omaha-5 / Big O) so opening a different game can't pollute those stats.
+  function gameTitle(root) { const t = root.querySelector('.header .title'); return t ? (t.innerText || '') : ''; }
+  function isCalibratedGame(root) { return /Omaha-5|Big\s*O/i.test(gameTitle(root)); }
+  function tableKey(root) { return root.id || tableName(root); }
+  function recordPref(root) {
+    const t = (store.cfg.tables = store.cfg.tables || {});
+    const k = tableKey(root);
+    if (!(k in t)) { t[k] = { record: isCalibratedGame(root) }; save(LS.CFG, store.cfg); }
+    return t[k].record;
+  }
+  function setRecordPref(root, on) {
+    const t = (store.cfg.tables = store.cfg.tables || {});
+    t[tableKey(root)] = { record: on }; save(LS.CFG, store.cfg);
+  }
+  function recordingOn(root) { return store.cfg.recording && recordPref(root); }
 
   // ---------------------------------------------------------------------------
   // Per-table engine (hand detection + recorder feed). Action inference is
@@ -210,11 +232,12 @@
   function engineFor(root) {
     if (engines.has(root)) return engines.get(root);
     const eng = {
-      root, hand: null, lastSig: '',
+      root, hand: null, lastSig: '', rec: makeRecorder(),
       onMutation() {
         const hand = handNo(root);
         if (hand && hand !== this.hand) { this.endHand(); this.startHand(hand); }
         if (!this.hand) return;
+        if (!recordingOn(root)) return;                 // master + per-table gate
         const seats = readSeats(root);
         const pot = potOf(root);
         const street = streetName(boardCount(root));
@@ -222,12 +245,13 @@
         const sig = seats.map((s) => `${s.name}:${s.info}:${s.committed}:${s.active}`).join('|') + '#' + pot + '#' + street + '#' + JSON.stringify(bd);
         if (sig === this.lastSig) return;
         this.lastSig = sig;
-        recorder.frame(seats, pot, street, bd);
+        if (!this.rec.cur) this.rec.start(root, this.hand); // lazy start (e.g. recording toggled on mid-hand)
+        this.rec.frame(seats, pot, street, bd);
       },
-      startHand(hand) { this.hand = hand; this.lastSig = ''; recorder.start(root, hand); },
+      startHand(hand) { this.hand = hand; this.lastSig = ''; if (recordingOn(root)) this.rec.start(root, hand); },
       endHand() {
         if (!this.hand) return;
-        const done = recorder.end();
+        const done = this.rec.end();
         this.hand = null;
         if (done && applyHand(done)) { save(LS.STATS, store.stats); save(LS.APPLIED, store.applied); renderPanels(); }
       },
@@ -354,6 +378,7 @@
     panelOffset = (panelOffset + 30) % 120;
     p.innerHTML =
       `<div class="ddhud-hd"><span class="sp">HUD <span class="sub"></span></span>` +
+      `<span class="ddhud-rectog" title="Record & track this table">REC</span>` +
       `<span class="ddhud-min" title="Collapse/expand">–</span></div>` +
       `<div class="ddhud-body"><table class="ddhud-tbl"><thead><tr>` +
       `<th class="l" data-tip="Player name. Click a row to add notes and behavior tags.">Player</th>` +
@@ -367,12 +392,21 @@
       p.classList.toggle('ddhud-collapsed');
       p.querySelector('.ddhud-min').textContent = p.classList.contains('ddhud-collapsed') ? '+' : '–';
     });
+    p.querySelector('.ddhud-rectog').addEventListener('click', (e) => {
+      e.stopPropagation();
+      setRecordPref(root, !recordPref(root));
+      paintPanel(p, root);
+    });
     attachTooltips(p);
     return p;
   }
 
   function paintPanel(p, root) {
     p.querySelector('.ddhud-hd .sub').textContent = '— ' + tableName(root);
+    const rec = recordPref(root);
+    const tog = p.querySelector('.ddhud-rectog');
+    tog.classList.toggle('on', !!rec);
+    tog.title = rec ? 'Recording & tracking this table — click to stop' : 'Not tracking this table — click to record';
     const hero = heroName(root);
     const seated = readSeats(root).filter((s) => isPlayer(s.name));
     const tbody = p.querySelector('tbody');
@@ -393,7 +427,7 @@
     });
     const capBits = [];
     if (seated.every((s) => !(store.stats[s.name] && store.stats[s.name].hands))) capBits.push('Stats show “–” until calibrated.');
-    if (store.cfg.recording) capBits.push('Recording ●');
+    capBits.push(recordingOn(root) ? 'Recording ●' : (store.cfg.recording ? 'Not tracking this table' : 'Recording off (all)'));
     p.querySelector('.ddhud-cap').textContent = capBits.join('   ');
   }
 
@@ -579,6 +613,9 @@
   .ddhud-hd .sp{flex:1}
   .ddhud-hd .sub{opacity:.55;font-weight:400;font-size:11px}
   .ddhud-min{cursor:pointer;opacity:.6;padding:0 4px;font-weight:700}
+  .ddhud-rectog{cursor:pointer;font-size:9px;font-weight:700;letter-spacing:.03em;padding:1px 5px;margin-right:4px;border-radius:4px;border:1px solid #4a3a3a;color:#c98f8f;background:#2a1e1e}
+  .ddhud-rectog.on{color:#8fd3a0;border-color:#2e5a3e;background:#16281c}
+  .ddhud-rectog.on::before{content:"● "}
   .ddhud-collapsed .ddhud-body{display:none}
   .ddhud-tbl{width:100%;border-collapse:collapse}
   .ddhud-tbl th{font-size:9px;text-transform:uppercase;letter-spacing:.02em;color:#7f8db0;font-weight:600;padding:5px 3px;text-align:right;border-bottom:1px solid #2a3350;cursor:help}
@@ -643,7 +680,7 @@
     obs.observe(document.body, { subtree: true, childList: true, characterData: true, attributes: true });
     setInterval(renderPanels, 800);
     console.log('[ddhud] Poker Mavens HUD loaded. Recording=' + store.cfg.recording);
-    window.__ddhud = { store, tableRoots, readSeats, recorder, engines, renderPanels };
+    window.__ddhud = { store, tableRoots, readSeats, engines, renderPanels, parseHandPreflop, backfillStats };
   }
 
   function boot() {
